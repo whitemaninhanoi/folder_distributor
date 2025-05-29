@@ -1,0 +1,39 @@
+# Archivos binarios generados
+*.exe
+*.dll
+*.so
+*.dylib
+*.out
+
+# Archivos de compilación
+*.o
+*.a
+
+# Directorios de compilación
+/build/
+/bin/
+
+# Archivos de configuración del IDE
+.idea/
+.vscode/
+*.iml
+
+# Archivos de logs
+*.log
+
+# Archivos temporales del sistema operativo
+.DS_Store
+Thumbs.db
+
+# Archivos de dependencias
+vendor/
+
+# Archivos generados por Go
+*.test
+*.prof
+*.cover
+
+# Archivos temporales
+*.tmp
+*.swp
+*.swo
