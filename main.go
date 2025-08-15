@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"golang.org/x/sys/windows"
 	"io"
 	"log"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 )
 
 type Destinations []string
@@ -25,10 +27,17 @@ type CopyMetric struct {
 	DurationSec float64 `csv:"duration_sec"`
 	Success     bool    `csv:"success"`
 	Mode        string  `csv:"mode"`
+	Type        string  `csv:"type"` // "local" o "remote"
+}
+
+type BuildDelivery struct {
+	ModTime      string   `json:"modTime"`
+	Destinations []string `json:"destinations"`
 }
 
 const childrenPath = "destinations.json"
-const folderRegistryFile = ".distributed_folders.json"
+const remoteChildrenPath = "remote_destinations.json"
+const folderRegistryFile = ".new_distributed_folders.json"
 const logFilePath = "output.log"
 const setUpLogPath = "setup.log"
 
@@ -44,11 +53,14 @@ var (
 func main() {
 	watchDir := flag.String("watch", "", "Carpeta a monitorear")
 	interval := flag.Int("interval", 10, "Segundos entre cada escaneo")
-	parallelism := flag.Int("parallel", 1, "Copias en paralelo (1-4)")
-	useTimestampName := flag.Bool("timestamp-name", false, "Usar nombre con timestamp en las copias")
+	parallelLocal := flag.Int("parallel-local", 1, "Copias en paralelo para destinos locales")
+	parallelRemote := flag.Int("parallel-remote", 1, "Copias en paralelo para destinos remotos")
+	parallelUsb := flag.Int("parallel-usb", 1, "Copias en paralelo para discos USB (solo si --usb está activo)")
 	savePrompt := flag.Bool("save-prompt", false, "Guardar el prompt de la copia")
 	metricsPathFlag := flag.String("metrics-path", "", "Ruta del folder donde se guardarán los logs de métricas")
 	childrenPathFlag := flag.String("children-path", childrenPath, "Ruta del archivo JSON con los destinos")
+	remoteChildrenPathFlag := flag.String("remote-children-path", remoteChildrenPath, "Ruta del archivo JSON con los destinos remotos")
+	usbMode := flag.Bool("usb", false, "Si está activo, copia a discos USB en lugar de destinos configurados")
 	flag.Parse()
 
 	initSetupLogger(*savePrompt)
@@ -58,8 +70,16 @@ func main() {
 		return
 	}
 
-	if *parallelism < 1 || *parallelism > 4 {
-		setupMessage("[ERROR] El valor de --parallel debe estar entre 1 y 4")
+	if *parallelLocal < 1 || *parallelLocal > 4 {
+		setupMessage("[ERROR] --parallel-local debe estar entre 1 y 4")
+		return
+	}
+	if *parallelRemote < 1 || *parallelRemote > 10 {
+		setupMessage("[ERROR] --parallel-remote debe estar entre 1 y 10")
+		return
+	}
+	if *parallelUsb < 1 || *parallelUsb > 4 {
+		setupMessage("[ERROR] --parallel-usb debe estar entre 1 y 4")
 		return
 	}
 
@@ -70,8 +90,9 @@ func main() {
 		}
 	}
 
-	setupMessage("[INFO] Monitoreando: %s | Intervalo: %d segundos | Copias en paralelo: %d", *watchDir, *interval, *parallelism)
-	setupMessage("[INFO] Versión: 0.2.0")
+	setupMessage("[INFO] Monitoreando: %s | Intervalo: %d segundos | Paralelismo local: %d | remoto: %d",
+		*watchDir, *interval, *parallelLocal, *parallelRemote)
+	setupMessage("[INFO] Versión: 0.3.1")
 
 	distributedFolders := readDistributedFolders()
 	for {
@@ -89,6 +110,21 @@ func main() {
 			name := entry.Name()
 			fullPath := filepath.Join(*watchDir, name)
 
+			parts := strings.SplitN(name, "__", 2)
+			buildName := parts[0]
+			var id string
+
+			if len(parts) == 2 {
+				id = parts[1] // ya viene con ID
+			} else {
+				modTime, err := getFolderModTime(fullPath)
+				if err != nil {
+					setupMessage("[ERROR] No se pudo obtener modTime para %s: %v", name, err)
+					continue
+				}
+				id = modTime.UTC().Format("20060102_150405") // genera ID único
+			}
+
 			if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
 				continue
 			}
@@ -102,13 +138,16 @@ func main() {
 			currentDate := time.Now().Format("01_02_2006_15_04_05")
 			promptLogDir := filepath.Join("prompt_logs", currentDate)
 
-			dests, err := loadChildren(*childrenPathFlag)
-			if err != nil {
-				setupMessage("[ERROR] No se pudieron leer los destinos: %v", err)
-				continue
+			destSets := []struct {
+				Path string
+				Type string
+			}{
+				{*childrenPathFlag, "local"},
+				{*remoteChildrenPathFlag, "remote"},
 			}
 
-			sem := make(chan struct{}, *parallelism)
+			var semLocal = make(chan struct{}, *parallelLocal)
+			var semRemote = make(chan struct{}, *parallelRemote)
 			var wg sync.WaitGroup
 			var successMutex sync.Mutex
 			logCreated := false
@@ -123,110 +162,146 @@ func main() {
 				}
 			}
 
-			var metricsPathOnce sync.Once
-			for _, d := range dests {
-				dest := d
+			modTime, err := getFolderModTime(fullPath)
+			if err != nil {
+				setupMessage("[ERROR] No se pudo obtener modTime para %s: %v", name, err)
+				continue
+			}
+			modTimeStr := modTime.UTC().Format(time.RFC3339)
 
-				if contains(distributedFolders[name], dest) {
-					setupMessage("[SKIP] Ya se entregó a %s: %s", dest, name)
+			var metricsPathOnce sync.Once
+			totalCopies := 0
+			semaphores := map[string]chan struct{}{
+				"local":  semLocal,
+				"remote": semRemote,
+			}
+			for _, set := range destSets {
+				dests, err := loadChildren(set.Path)
+				if err != nil {
+					setupMessage("[WARN] No se pudieron cargar destinos %s: %v", set.Type, err)
+					continue
+				}
+				if len(dests) == 0 {
+					setupMessage("[WARN] No hay destinos accesibles para tipo %s", set.Type)
 					continue
 				}
 
-				sem <- struct{}{}
-				wg.Add(1)
+				for _, d := range dests {
+					dest := d
 
-				if !logCreated && *savePrompt {
-					err1 := os.MkdirAll(promptLogDir, os.ModePerm)
-					if err1 != nil {
-						setupMessage("[ERROR] No se pudo crear carpeta de prompt logs para %s: %v", name, err1)
-						break
+					if alreadyDelivered(distributedFolders, name, modTimeStr, dest) {
+						setupMessage("[SKIP] Ya se entregó a %s: %s", dest, name)
+						continue
 					}
-					activityLogPath = filepath.Join(promptLogDir, fmt.Sprintf("%s_%s", currentDate, logFilePath))
-					InitLogger(activityLogPath, *savePrompt)
-				}
 
-				go func(dest string) {
+					semaphores[set.Type] <- struct{}{}
+					wg.Add(1)
 
-					defer wg.Done()
-					defer func() { <-sem }()
-
-					finalName := name
-					if *useTimestampName {
-						now := time.Now().Format("2006-01-02 15_04")
-						base := name
-						finalName = fmt.Sprintf("%s %s", now, base)
-					}
-					finalDest := filepath.Join(dest, finalName)
-					logMessage("[COPY] Copiando a: %s", finalDest)
-
-					var start time.Time
-					var total int64 = 0
-
-					var copied int64
-					start = time.Now()
-					total = calculateTotalSize(fullPath)
-					err = copyDirectory(fullPath, finalDest, dest, total, &copied, start)
-
-					originalFolderName := strings.TrimSuffix(name, ".zip")
-					sourceFolderPath := filepath.Join(*watchDir, originalFolderName)
-					copyReceipt(sourceFolderPath, dest)
-
-					if err != nil {
-						logMessage("[ERROR] Error al copiar a %s: %v", dest, err)
-					} else {
-						logMessage("[OK] Copia completa a: %s", dest)
-
-						duration := time.Since(start).Seconds()
-						sizeMB := float64(total) / (1024 * 1024)
-
-						metricsPathOnce.Do(func() {
-							baseDir := "logs"
-							if *metricsPathFlag != "" {
-								baseDir = filepath.Join(*metricsPathFlag, "logs")
-							}
-
-							rawHostname := extractSourceName("")
-							hostname := sanitizeForFilename(rawHostname)
-							buildName := sanitizeForFilename(name)
-							timestamp := time.Now().Format("15-04-05")
-							uniqueID := fmt.Sprintf("%06d", time.Now().UnixNano()%1e6)
-
-							buildDir := filepath.Join(baseDir, buildName)
-							metricsFilePath = filepath.Join(buildDir, fmt.Sprintf("metrics_%s_%s_%s_%s.csv", buildName, hostname, timestamp, uniqueID))
-						})
-
-						metricsMutex.Lock()
-						startTime := start.UTC().Format("2006-01-02 15:04:05")
-						endTime := time.Now().UTC().Format("2006-01-02 15:04:05")
-						copyMetrics = append(copyMetrics, CopyMetric{
-							StartTime:   startTime,
-							EndTime:     endTime,
-							Name:        name,
-							Destination: dest,
-							SizeMB:      sizeMB,
-							DurationSec: duration,
-							Success:     true,
-							Mode:        "folder",
-						})
-						metricsMutex.Unlock()
-
-						successMutex.Lock()
-						deliveredList := distributedFolders[name]
-						if !contains(deliveredList, dest) {
-							distributedFolders[name] = append(deliveredList, dest)
+					if !logCreated && *savePrompt {
+						err1 := os.MkdirAll(promptLogDir, os.ModePerm)
+						if err1 != nil {
+							setupMessage("[ERROR] No se pudo crear carpeta de prompt logs para %s: %v", name, err1)
+							break
 						}
-						successMutex.Unlock()
+						activityLogPath = filepath.Join(promptLogDir, fmt.Sprintf("%s_%s", currentDate, logFilePath))
+						InitLogger(activityLogPath, *savePrompt)
 					}
 
-				}(dest)
+					go func(dest string, destType string) {
+
+						defer wg.Done()
+						defer func() {
+							if r := recover(); r != nil {
+								logMessage("[ERROR] Panic en hilo de copia: %v", r)
+							}
+							<-semaphores[destType]
+						}()
+
+						finalName := fmt.Sprintf("%s__%s", buildName, id)
+						finalDest := filepath.Join(dest, finalName)
+						logMessage("[COPY] Copiando a: %s", finalDest)
+
+						var start time.Time
+						var total int64 = 0
+
+						var copied int64
+						start = time.Now()
+						total = calculateTotalSize(fullPath)
+						successMutex.Lock()
+						totalCopies++
+						successMutex.Unlock()
+						err = copyDirectory(fullPath, finalDest, dest, total, &copied, start)
+
+						copyReceipt(fullPath, finalDest)
+
+						if err != nil {
+							logMessage("[ERROR] Error al copiar a %s: %v", dest, err)
+						} else {
+							logMessage("[OK] Copia completa a: %s", dest)
+
+							duration := time.Since(start).Seconds()
+							sizeMB := float64(total) / (1024 * 1024)
+
+							metricsPathOnce.Do(func() {
+								baseDir := "logs"
+								if *metricsPathFlag != "" {
+									baseDir = filepath.Join(*metricsPathFlag, "logs")
+								}
+
+								rawHostname := extractSourceName("")
+								hostname := sanitizeForFilename(rawHostname)
+
+								// Usa finalName en lugar de construirlo otra vez
+								buildDir := filepath.Join(baseDir, finalName)
+
+								timestamp := time.Now().Format("15-04-05")
+								uniqueID := fmt.Sprintf("%06d", time.Now().UnixNano()%1e6)
+
+								metricsFilePath = filepath.Join(buildDir,
+									fmt.Sprintf("metrics_%s_%s_%s.csv", hostname, timestamp, uniqueID))
+							})
+
+							metricsMutex.Lock()
+							startTime := start.UTC().Format("2006-01-02 15:04:05")
+							endTime := time.Now().UTC().Format("2006-01-02 15:04:05")
+							copyMetrics = append(copyMetrics, CopyMetric{
+								StartTime:   startTime,
+								EndTime:     endTime,
+								Name:        name,
+								Destination: dest,
+								SizeMB:      sizeMB,
+								DurationSec: duration,
+								Success:     true,
+								Mode:        "folder",
+								Type:        destType,
+							})
+							metricsMutex.Unlock()
+
+							successMutex.Lock()
+							updateDeliveryRegistry(distributedFolders, name, modTimeStr, dest)
+							successMutex.Unlock()
+						}
+
+					}(dest, set.Type)
+				}
 			}
 
 			wg.Wait()
+
+			if *usbMode {
+				handleUSBMode(fullPath, buildName, id, name, modTimeStr, distributedFolders, metricsFilePath, *parallelUsb)
+			}
+
+			if totalCopies == 0 {
+				setupMessage("[INFO] Ningún destino disponible o todos ya recibieron: %s", name)
+			}
 
 			writeDistributedFolders(distributedFolders)
 
 			if len(copyMetrics) > 0 {
 				saveMetricsCSV(metricsFilePath)
+			} else {
+				setupMessage("[INFO] No se generó metrics.csv porque no hubo copias exitosas para: %s", name)
 			}
 			copyMetrics = nil
 		}
@@ -394,27 +469,36 @@ func loadChildren(path string) (Destinations, error) {
 	var d Destinations
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("no se pudo leer archivo %s: %w", path, err)
+		logMessage("[WARN] No se pudo leer archivo de destinos (%s): %v", path, err)
+		return nil, nil
 	}
 	if err := json.Unmarshal(data, &d); err != nil {
 		return nil, fmt.Errorf("error al parsear JSON en %s: %w", path, err)
 	}
-	return d, nil
+
+	var reachable Destinations
+	for _, raw := range d {
+		if _, err := os.Stat(raw); err != nil {
+			logMessage("[WARN] Destino no disponible o inaccesible: %s", raw)
+		}
+		reachable = append(reachable, raw)
+	}
+	return reachable, nil
 }
 
-func readDistributedFolders() map[string][]string {
+func readDistributedFolders() map[string][]BuildDelivery {
 	data, err := os.ReadFile(folderRegistryFile)
 	if err != nil {
-		return make(map[string][]string)
+		return make(map[string][]BuildDelivery)
 	}
-	var registry map[string][]string
+	var registry map[string][]BuildDelivery
 	if err := json.Unmarshal(data, &registry); err != nil {
-		return make(map[string][]string)
+		return make(map[string][]BuildDelivery)
 	}
 	return registry
 }
 
-func writeDistributedFolders(registry map[string][]string) {
+func writeDistributedFolders(registry map[string][]BuildDelivery) {
 	data, _ := json.MarshalIndent(registry, "", "  ")
 	tmpFile := folderRegistryFile + ".tmp"
 	if err := os.WriteFile(tmpFile, data, 0644); err == nil {
@@ -431,13 +515,39 @@ func hasReceipt(folderPath string) bool {
 }
 
 func copyReceipt(folderPath, dest string) {
-	base := filepath.Base(folderPath)
-	pattern := filepath.Join(filepath.Dir(folderPath), base+" - *.txt")
+	base := filepath.Base(folderPath) // Ej: TEST3__20250529_224534
+	parts := strings.SplitN(base, "__", 2)
+	buildName := parts[0]
+
+	// Buscar cualquier txt que contenga el nombre base aunque tenga espacios
+	dir := filepath.Dir(folderPath)
+	cleanName := strings.ReplaceAll(buildName, " ", "")
+	pattern := filepath.Join(dir, "*"+cleanName+"* - *.txt")
+
 	matches, _ := filepath.Glob(pattern)
 
+	if len(matches) == 0 {
+		logMessage("[DEBUG] No se encontró recibo con patrón: %s", pattern)
+		return
+	}
+
 	for _, receiptPath := range matches {
-		destPath := filepath.Join(dest, filepath.Base(receiptPath))
-		err := copyFile(receiptPath, destPath)
+		originalName := filepath.Base(receiptPath)
+		parts := strings.SplitN(originalName, " - ", 2)
+		if len(parts) < 2 {
+			logMessage("Recibo con nombre inválido: %s", receiptPath)
+			continue
+		}
+		newReceiptName := filepath.Base(dest) + " - " + parts[1]
+		destPath := filepath.Join(filepath.Dir(dest), newReceiptName)
+
+		err := os.MkdirAll(filepath.Dir(destPath), os.ModePerm)
+		if err != nil {
+			logMessage("[ERROR] No se pudo crear directorio destino para el recibo: %v", err)
+			continue
+		}
+
+		err = copyFile(receiptPath, destPath)
 		if err != nil {
 			logMessage("Error al copiar recibo %s: %v", receiptPath, err)
 		} else {
@@ -535,6 +645,7 @@ func saveMetricsCSV(path string) {
 		"formatted_time",
 		"success",
 		"mode",
+		"type",
 	})
 
 	metricsMutex.Lock()
@@ -559,6 +670,7 @@ func saveMetricsCSV(path string) {
 			formattedTime,
 			fmt.Sprintf("%t", m.Success),
 			m.Mode,
+			m.Type,
 		})
 	}
 }
@@ -590,4 +702,142 @@ func sanitizeForFilename(input string) string {
 		":", "_",
 	)
 	return replacer.Replace(input)
+}
+
+func getFolderModTime(path string) (time.Time, error) {
+	var latest time.Time
+	err := filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.ModTime().After(latest) {
+			latest = info.ModTime()
+		}
+		return nil
+	})
+	return latest, err
+}
+
+func alreadyDelivered(registry map[string][]BuildDelivery, name, modTime, dest string) bool {
+	for _, entry := range registry[name] {
+		if entry.ModTime == modTime && contains(entry.Destinations, dest) {
+			return true
+		}
+	}
+	return false
+}
+
+func updateDeliveryRegistry(registry map[string][]BuildDelivery, name, modTime, dest string) {
+	entries := registry[name]
+	for i, entry := range entries {
+		if entry.ModTime == modTime {
+			if !contains(entry.Destinations, dest) {
+				registry[name][i].Destinations = append(registry[name][i].Destinations, dest)
+			}
+			return
+		}
+	}
+	// Si no existe ese modTime, lo agregamos
+	registry[name] = append(registry[name], BuildDelivery{
+		ModTime:      modTime,
+		Destinations: []string{dest},
+	})
+}
+
+func handleUSBMode(fullPath, buildName, id, name, modTimeStr string, distributedFolders map[string][]BuildDelivery, metricsFilePath string, parallelUsb int) {
+	usbDrives := listUSBDrives()
+	if len(usbDrives) == 0 {
+		setupMessage("[WARN] No se detectaron discos USB montados, se omite la copia a USB")
+		return
+	}
+
+	semUSB := make(chan struct{}, parallelUsb) // <- le pasas parallelUsb aquí
+	var wg sync.WaitGroup
+
+	for _, dest := range usbDrives {
+		semUSB <- struct{}{}
+		wg.Add(1)
+
+		go func(dest string) {
+			defer wg.Done()
+			defer func() { <-semUSB }()
+
+			finalName := fmt.Sprintf("%s__%s", buildName, id)
+			finalDest := filepath.Join(dest, finalName)
+			logMessage("[COPY][USB] Copiando a: %s", finalDest)
+
+			var total = calculateTotalSize(fullPath)
+			var copied int64
+			start := time.Now()
+
+			err := copyDirectory(fullPath, finalDest, dest, total, &copied, start)
+			copyReceipt(fullPath, finalDest)
+
+			if err != nil {
+				logMessage("[ERROR][USB] Error al copiar a %s: %v", dest, err)
+			} else {
+				logMessage("[OK][USB] Copia completa a: %s", dest)
+
+				duration := time.Since(start).Seconds()
+				sizeMB := float64(total) / (1024 * 1024)
+
+				metricsMutex.Lock()
+				startTime := start.UTC().Format("2006-01-02 15:04:05")
+				endTime := time.Now().UTC().Format("2006-01-02 15:04:05")
+				copyMetrics = append(copyMetrics, CopyMetric{
+					StartTime:   startTime,
+					EndTime:     endTime,
+					Name:        name,
+					Destination: dest,
+					SizeMB:      sizeMB,
+					DurationSec: duration,
+					Success:     true,
+					Mode:        "folder",
+					Type:        "usb",
+				})
+				metricsMutex.Unlock()
+
+				updateDeliveryRegistry(distributedFolders, name, modTimeStr, dest)
+			}
+		}(dest)
+	}
+
+	wg.Wait()
+
+	if len(copyMetrics) > 0 {
+		saveMetricsCSV(metricsFilePath)
+	} else {
+		setupMessage("[INFO] No se generó metrics.csv porque no hubo copias exitosas para: %s", name)
+	}
+	copyMetrics = nil
+}
+
+func listUSBDrives() []string {
+	var usbDrives []string
+
+	kernel32 := windows.NewLazySystemDLL("kernel32.dll")
+	getLogicalDrives := kernel32.NewProc("GetLogicalDrives")
+
+	ret, _, err := getLogicalDrives.Call()
+	if ret == 0 {
+		log.Printf("[ERROR] GetLogicalDrives falló: %v", err)
+		return usbDrives
+	}
+
+	driveBits := uint32(ret)
+
+	for i := 0; i < 26; i++ {
+		if driveBits&(1<<i) != 0 {
+			letter := string(rune('A'+i)) + ":\\"
+
+			getDriveType := kernel32.NewProc("GetDriveTypeW")
+			driveType, _, _ := getDriveType.Call(uintptr(unsafe.Pointer(windows.StringToUTF16Ptr(letter))))
+
+			// DRIVE_REMOVABLE == 2 (según la WinAPI)
+			if driveType == 2 {
+				usbDrives = append(usbDrives, letter)
+			}
+		}
+	}
+	return usbDrives
 }
